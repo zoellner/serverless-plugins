@@ -1,224 +1,202 @@
-const {join} = require('path');
-const {Writable} = require('stream');
-const figures = require('figures');
-const DynamoDBStreams = require('aws-sdk/clients/dynamodbstreams');
-const DynamoDB = require('aws-sdk/clients/dynamodb');
-const {
-  filter,
-  forEach,
-  get,
-  isEmpty,
-  map,
-  mapValues,
-  matchesProperty,
-  pipe,
-  startsWith
-} = require('lodash/fp');
-const {createHandler, getFunctionOptions} = require('serverless-offline/src/functionHelper');
-const createLambdaContext = require('serverless-offline/src/createLambdaContext');
-const DynamoDBReadable = require('dynamodb-streams-readable');
+const {assign, omitBy, isUndefined, get, startsWith, pick} = require('lodash/fp');
 
-const fromCallback = fun =>
-  new Promise((resolve, reject) => {
-    fun((err, data) => {
-      if (err) return reject(err);
-      resolve(data);
-    });
-  });
+const debugLog = require('serverless-offline/dist/debugLog').default;
+const {default: serverlessLog, setLog} = require('serverless-offline/dist/serverlessLog');
+const Lambda = require('serverless-offline/dist/lambda').default;
 
-const printBlankLine = () => console.log();
+const DynamodbStreams = require('./dynamodb-streams');
 
-const getConfig = (service, pluginName) => {
-  return (service && service.custom && service.custom[pluginName]) || {};
+const OFFLINE_OPTION = 'serverless-offline';
+const CUSTOM_OPTION = 'serverless-offline-dynamodb-streams';
+
+const SERVER_SHUTDOWN_TIMEOUT = 5000;
+
+const defaultOptions = {
+  accessKeyId: '000000000000'
 };
 
-const extractTableNameFromARN = arn => {
-  const [, , , , , TableURI] = arn.split(':');
-  const [, TableName] = TableURI.split('/');
-  return TableName;
-};
+const omitUndefined = omitBy(isUndefined);
 
-class ServerlessOfflineDynamoDBStreams {
-  constructor(serverless, options) {
+class ServerlessOfflineDynamodbStreams {
+  constructor(serverless, cliOptions) {
+    this.cliOptions = null;
+    this.options = null;
+    this.dynamodbStreams = null;
+    this.lambda = null;
+    this.serverless = null;
+
+    this.cliOptions = cliOptions;
     this.serverless = serverless;
-    this.service = serverless.service;
-    this.options = options;
-    this.config = getConfig(this.service, 'serverless-offline-dynamodb-streams');
 
-    this.commands = {};
+    setLog((...args) => serverless.cli.log(...args));
 
     this.hooks = {
-      'before:offline:start:init': this.offlineStartInit.bind(this),
-      'before:offline:start:end': this.offlineStartEnd.bind(this)
+      'offline:start:init': this.start.bind(this),
+      'offline:start:ready': this.ready.bind(this),
+      'offline:start': this._startWithExplicitEnd.bind(this),
+      'offline:start:end': this.end.bind(this)
     };
-
-    this.streams = [];
   }
 
-  getDynamoDBClient() {
-    const awsConfig = Object.assign(
-      {
-        region: this.options.region || this.service.provider.region || 'us-west-2'
-      },
-      this.config
-    );
-    return new DynamoDB(awsConfig);
-  }
+  async start() {
+    process.env.IS_OFFLINE = true;
 
-  getDynamoDBStreamsClient() {
-    const awsConfig = Object.assign(
-      {
-        region: this.options.region || this.service.provider.region || 'us-west-2'
-      },
-      this.config
-    );
-    return new DynamoDBStreams(awsConfig);
-  }
+    this._mergeOptions();
 
-  eventHandler(streamARN, functionName, shardId, Records, cb) {
-    this.serverless.cli.log(`${extractTableNameFromARN(streamARN)} (λ: ${functionName})`);
+    const {dynamodbStreamsEvents, lambdas} = this._getEvents();
 
-    const {location = '.'} = getConfig(this.service, 'serverless-offline');
+    this._createLambda(lambdas);
 
-    const __function = this.service.getFunction(functionName);
+    const eventModules = [];
 
-    const {env} = process;
-    const functionEnv = Object.assign(
-      {},
-      env,
-      get('service.provider.environment', this),
-      get('environment', __function)
-    );
-    process.env = functionEnv;
-
-    const servicePath = join(this.serverless.config.servicePath, location);
-    const funOptions = getFunctionOptions(__function, functionName, servicePath);
-    const handler = createHandler(funOptions, Object.assign({}, this.options, this.config));
-
-    const lambdaContext = createLambdaContext(__function, (err, data) => {
-      this.serverless.cli.log(
-        `[${err ? figures.cross : figures.tick}] ${JSON.stringify(data) || ''}`
-      );
-      cb(err, data);
-    });
-    const event = {
-      Records
-    };
-
-    if (handler.length < 3)
-      handler(event, lambdaContext)
-        .then(res => lambdaContext.done(null, res))
-        .catch(lambdaContext.done);
-    else handler(event, lambdaContext, lambdaContext.done);
-
-    process.env = env;
-  }
-
-  async createDynamoDBStreamReadable(functionName, tableEvent) {
-    const dynamodbClient = this.getDynamoDBClient();
-    const dynamodbStreamsClient = this.getDynamoDBStreamsClient();
-    const tableName = this.getTableName(tableEvent);
-
-    const streamARN = await fromCallback(cb =>
-      dynamodbClient.describeTable(
-        {
-          TableName: tableName
-        },
-        cb
-      )
-    ).then(get('Table.LatestStreamArn'));
-
-    this.serverless.cli.log(`${streamARN}`);
-
-    const {StreamDescription: {Shards: shards}} = await fromCallback(cb =>
-      dynamodbStreamsClient.describeStream(
-        {
-          StreamArn: streamARN
-        },
-        cb
-      )
-    );
-
-    forEach(({ShardId: shardId}) => {
-      const readable = DynamoDBReadable(
-        dynamodbStreamsClient,
-        streamARN,
-        Object.assign({}, this.config, {
-          shardId,
-          limit: tableEvent.batchSize,
-          iterator: tableEvent.startingPosition || 'TRIM_HORIZON'
-        })
-      );
-
-      readable.pipe(
-        new Writable({
-          objectMode: true,
-          write: (chunk, encoding, cb) => {
-            this.eventHandler(streamARN, functionName, shardId, chunk, cb);
-          }
-        })
-      );
-    }, shards);
-  }
-
-  getTableName(tableEvent) {
-    if (typeof tableEvent === 'string' && startsWith('arn:aws:dynamodb', tableEvent))
-      return extractTableNameFromARN(tableEvent);
-    if (typeof tableEvent.arn === 'string') return extractTableNameFromARN(tableEvent.arn);
-    if (typeof tableEvent.streamName === 'string') return tableEvent.streamName;
-
-    if (tableEvent.arn['Fn::GetAtt']) {
-      const [ResourceName] = tableEvent.arn['Fn::GetAtt'];
-
-      if (
-        this.service &&
-        this.service.resources &&
-        this.service.resources.Resources &&
-        this.service.resources.Resources[ResourceName] &&
-        this.service.resources.Resources[ResourceName].Properties &&
-        typeof this.service.resources.Resources[ResourceName].Properties.TableName === 'string'
-      )
-        return this.service.resources.Resources[ResourceName].Properties.TableName;
+    if (dynamodbStreamsEvents.length > 0) {
+      eventModules.push(this._createDynamodbStreams(dynamodbStreamsEvents));
     }
 
-    throw new Error(
-      `TableName not found. See https://github.com/CoorpAcademy/serverless-plugins/tree/master/packages/serverless-offline-dynamodb-streams#functions`
+    await Promise.all(eventModules);
+
+    serverlessLog(
+      `Starting Offline Dynamodb Streams: ${this.options.stage}/${this.options.region}.`
     );
   }
 
-  offlineStartInit() {
-    this.serverless.cli.log(`Starting Offline DynamodbStream.`);
-
-    mapValues.convert({cap: false})((_function, functionName) => {
-      const streams = pipe(
-        get('events'),
-        filter(
-          event =>
-            !matchesProperty('stream.enabled', false)(event) &&
-            (matchesProperty('stream.type', 'dynamodb')(event) ||
-              startsWith('arn:aws:dynamodb', event.stream))
-        ),
-        map(get('stream'))
-      )(_function);
-
-      if (!isEmpty(streams)) {
-        printBlankLine();
-        this.serverless.cli.log(`DynamodbStream for ${functionName}:`);
-      }
-
-      forEach(streamEvent => {
-        this.createDynamoDBStreamReadable(functionName, streamEvent);
-      }, streams);
-
-      if (!isEmpty(streams)) {
-        printBlankLine();
-      }
-    }, this.service.functions);
+  async ready() {
+    if (process.env.NODE_ENV !== 'test') {
+      await this._listenForTermination();
+    }
   }
 
-  offlineStartEnd() {
-    this.serverless.cli.log('offline-start-end');
+  // eslint-disable-next-line class-methods-use-this
+  async _listenForTermination() {
+    const command = await new Promise(resolve => {
+      process.on('SIGINT', () => resolve('SIGINT')).on('SIGTERM', () => resolve('SIGTERM'));
+    });
+
+    serverlessLog(`Got ${command} signal. Offline Halting...`);
+  }
+
+  async _startWithExplicitEnd() {
+    await this.start();
+    await this.ready();
+    this.end();
+  }
+
+  async end(skipExit) {
+    if (process.env.NODE_ENV === 'test' && skipExit === undefined) {
+      return;
+    }
+
+    serverlessLog('Halting offline server');
+
+    const eventModules = [];
+
+    if (this.lambda) {
+      eventModules.push(this.lambda.cleanup());
+    }
+
+    if (this.dynamodbStreams) {
+      eventModules.push(this.dynamodbStreams.stop(SERVER_SHUTDOWN_TIMEOUT));
+    }
+
+    await Promise.all(eventModules);
+
+    if (!skipExit) {
+      process.exit(0);
+    }
+  }
+
+  _createLambda(lambdas) {
+    this.lambda = new Lambda(this.serverless, this.options);
+
+    this.lambda.create(lambdas);
+  }
+
+  async _createDynamodbStreams(events, skipStart) {
+    this.dynamodbStreams = new DynamodbStreams(this.lambda, this.options);
+
+    await this.dynamodbStreams.create(events);
+
+    if (!skipStart) {
+      await this.dynamodbStreams.start();
+    }
+  }
+
+  _mergeOptions() {
+    const {
+      service: {custom = {}, provider}
+    } = this.serverless;
+
+    const offlineOptions = custom[OFFLINE_OPTION];
+    const customOptions = custom[CUSTOM_OPTION];
+
+    this.options = Object.assign(
+      {},
+      omitUndefined(defaultOptions),
+      omitUndefined(provider),
+      omitUndefined(pick('location', offlineOptions)), // serverless-webpack support
+      omitUndefined(customOptions),
+      omitUndefined(this.cliOptions)
+    );
+
+    debugLog('options:', this.options);
+  }
+
+  _getEvents() {
+    const {service} = this.serverless;
+
+    const lambdas = [];
+    const dynamodbStreamsEvents = [];
+
+    const functionKeys = service.getAllFunctions();
+
+    functionKeys.forEach(functionKey => {
+      const functionDefinition = service.getFunction(functionKey);
+
+      lambdas.push({functionKey, functionDefinition});
+
+      const events = service.getAllEventsInFunction(functionKey) || [];
+
+      events.forEach(event => {
+        const {stream} = event;
+
+        if (
+          stream &&
+          (stream.type === 'dynamodb' || startsWith('arn:aws:dynamodb', stream)) &&
+          functionDefinition.handler
+        ) {
+          dynamodbStreamsEvents.push({
+            functionKey,
+            handler: functionDefinition.handler,
+            dynamodbStreams: this._resolveFn(stream)
+          });
+        }
+      });
+    });
+
+    return {
+      dynamodbStreamsEvents,
+      lambdas
+    };
+  }
+
+  _resolveFn(event) {
+    if (typeof event.tableName === 'string') return event;
+
+    const getAtt = get(['arn', 'Fn::GetAtt'], event);
+    if (getAtt) {
+      const [resourceName] = getAtt;
+
+      const properties = get(
+        ['service', 'resources', 'Resources', resourceName, 'Properties'],
+        this.serverless
+      );
+      if (!properties) throw new Error(`No resource defined with name ${resourceName}`);
+
+      return assign(event, {tableName: properties.TableName});
+    }
+
+    return event;
   }
 }
 
-module.exports = ServerlessOfflineDynamoDBStreams;
+module.exports = ServerlessOfflineDynamodbStreams;

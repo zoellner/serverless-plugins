@@ -1,218 +1,239 @@
-const {join} = require('path');
-const figures = require('figures');
-const SQS = require('aws-sdk/clients/sqs');
-const {mapValues, isEmpty, forEach, map, has, filter, get, pipe} = require('lodash/fp');
-const {createHandler, getFunctionOptions} = require('serverless-offline/src/functionHelper');
-const createLambdaContext = require('serverless-offline/src/createLambdaContext');
+const {
+  compact,
+  fromPairs,
+  get,
+  has,
+  isPlainObject,
+  isUndefined,
+  map,
+  omitBy,
+  pick,
+  pipe,
+  toPairs
+} = require('lodash/fp');
 
-const fromCallback = fun =>
-  new Promise((resolve, reject) => {
-    fun((err, data) => {
-      if (err) return reject(err);
-      resolve(data);
-    });
-  });
+const debugLog = require('serverless-offline/dist/debugLog').default;
+const {default: serverlessLog, setLog} = require('serverless-offline/dist/serverlessLog');
+const Lambda = require('serverless-offline/dist/lambda').default;
 
-const printBlankLine = () => console.log();
+const SQS = require('./sqs');
 
-const getConfig = (service, pluginName) => {
-  return (service && service.custom && service.custom[pluginName]) || {};
+const OFFLINE_OPTION = 'serverless-offline';
+const CUSTOM_OPTION = 'serverless-offline-sqs';
+
+const SERVER_SHUTDOWN_TIMEOUT = 5000;
+
+const defaultOptions = {
+  batchSize: 100,
+  startingPosition: 'TRIM_HORIZON',
+  autoCreate: false,
+
+  accountId: '000000000000'
 };
 
-const extractQueueNameFromARN = arn => {
-  const [, , , , , QueueName] = arn.split(':');
-  return QueueName;
-};
+const omitUndefined = omitBy(isUndefined);
 
 class ServerlessOfflineSQS {
-  constructor(serverless, options) {
-    this.serverless = serverless;
-    this.service = serverless.service;
-    this.options = options;
-    this.config = getConfig(this.service, 'serverless-offline-sqs');
+  constructor(serverless, cliOptions) {
+    this.cliOptions = null;
+    this.options = null;
+    this.sqs = null;
+    this.lambda = null;
+    this.serverless = null;
 
-    this.commands = {};
+    this.cliOptions = cliOptions;
+    this.serverless = serverless;
+
+    setLog((...args) => serverless.cli.log(...args));
 
     this.hooks = {
-      'before:offline:start:init': this.offlineStartInit.bind(this),
-      'before:offline:start:end': this.offlineStartEnd.bind(this)
+      'offline:start:init': this.start.bind(this),
+      'offline:start:ready': this.ready.bind(this),
+      'offline:start': this._startWithExplicitEnd.bind(this),
+      'offline:start:end': this.end.bind(this)
     };
-
-    this.streams = [];
   }
 
-  getClient() {
-    const awsConfig = Object.assign(
-      {
-        region: this.options.region || this.service.provider.region || 'us-west-2'
-      },
-      this.config
-    );
-    return new SQS(awsConfig);
-  }
+  async start() {
+    process.env.IS_OFFLINE = true;
 
-  getQueueName(queueEvent) {
-    if (typeof queueEvent === 'string') return extractQueueNameFromARN(queueEvent);
-    if (typeof queueEvent.arn === 'string') return extractQueueNameFromARN(queueEvent.arn);
-    if (typeof queueEvent.queueName === 'string') return queueEvent.queueName;
+    this._mergeOptions();
 
-    if (queueEvent.arn['Fn::GetAtt']) {
-      const [ResourceName] = queueEvent.arn['Fn::GetAtt'];
+    const {sqsEvents, lambdas} = this._getEvents();
 
-      if (
-        this.service &&
-        this.service.resources &&
-        this.service.resources.Resources &&
-        this.service.resources.Resources[ResourceName] &&
-        this.service.resources.Resources[ResourceName].Properties &&
-        typeof this.service.resources.Resources[ResourceName].Properties.QueueName === 'string'
-      )
-        return this.service.resources.Resources[ResourceName].Properties.QueueName;
+    this._createLambda(lambdas);
+
+    const eventModules = [];
+
+    if (sqsEvents.length > 0) {
+      eventModules.push(this._createSqs(sqsEvents));
     }
 
-    throw new Error(
-      `QueueName not found. See https://github.com/CoorpAcademy/serverless-plugins/tree/master/packages/serverless-offline-sqs#functions`
-    );
+    await Promise.all(eventModules);
+
+    serverlessLog(`Starting Offline SQS: ${this.options.stage}/${this.options.region}.`);
   }
 
-  eventHandler(queueEvent, functionName, messages, cb) {
-    if (!messages) return cb();
+  async ready() {
+    if (process.env.NODE_ENV !== 'test') {
+      await this._listenForTermination();
+    }
+  }
 
-    const streamName = this.getQueueName(queueEvent);
-    this.serverless.cli.log(`${streamName} (λ: ${functionName})`);
-
-    const {location = '.'} = getConfig(this.service, 'serverless-offline');
-
-    const __function = this.service.getFunction(functionName);
-
-    const {env} = process;
-    const functionEnv = Object.assign(
-      {},
-      env,
-      get('service.provider.environment', this),
-      get('environment', __function)
-    );
-    process.env = functionEnv;
-
-    const servicePath = join(this.serverless.config.servicePath, location);
-
-    const funOptions = getFunctionOptions(__function, functionName, servicePath);
-    const handler = createHandler(funOptions, Object.assign({}, this.options, this.config));
-
-    const lambdaContext = createLambdaContext(__function, (err, data) => {
-      this.serverless.cli.log(
-        `[${err ? figures.cross : figures.tick}] ${JSON.stringify(data) || ''}`
-      );
-      cb(err, data);
+  // eslint-disable-next-line class-methods-use-this
+  async _listenForTermination() {
+    const command = await new Promise(resolve => {
+      process.on('SIGINT', () => resolve('SIGINT')).on('SIGTERM', () => resolve('SIGTERM'));
     });
 
-    const event = {
-      Records: messages.map(
-        ({
-          MessageId: messageId,
-          ReceiptHandle: receiptHandle,
-          Body: body,
-          Attributes: attributes,
-          MessageAttributes: messageAttributes,
-          MD5OfBody: md5OfBody
-        }) => ({
-          messageId,
-          receiptHandle,
-          body,
-          attributes,
-          messageAttributes,
-          md5OfBody,
-          eventSource: 'aws:sqs',
-          eventSourceARN: queueEvent.arn,
-          awsRegion: 'us-west-2'
-        })
-      )
-    };
-
-    if (handler.length < 3)
-      handler(event, lambdaContext)
-        .then(res => lambdaContext.done(null, res))
-        .catch(lambdaContext.done);
-    else handler(event, lambdaContext, lambdaContext.done);
-
-    process.env = env;
+    serverlessLog(`Got ${command} signal. Offline Halting...`);
   }
 
-  async createQueueReadable(functionName, queueEvent) {
-    const client = this.getClient();
-    const queueName = this.getQueueName(queueEvent);
+  async _startWithExplicitEnd() {
+    await this.start();
+    await this.ready();
+    this.end();
+  }
 
-    this.serverless.cli.log(`${queueName}`);
+  async end(skipExit) {
+    if (process.env.NODE_ENV === 'test' && skipExit === undefined) {
+      return;
+    }
 
-    const {QueueUrl} = await fromCallback(cb =>
-      client.getQueueUrl(
-        {
-          QueueName: queueName
-        },
-        cb
-      )
+    serverlessLog('Halting offline server');
+
+    const eventModules = [];
+
+    if (this.lambda) {
+      eventModules.push(this.lambda.cleanup());
+    }
+
+    if (this.sqs) {
+      eventModules.push(this.sqs.stop(SERVER_SHUTDOWN_TIMEOUT));
+    }
+
+    await Promise.all(eventModules);
+
+    if (!skipExit) {
+      process.exit(0);
+    }
+  }
+
+  _createLambda(lambdas) {
+    this.lambda = new Lambda(this.serverless, this.options);
+
+    this.lambda.create(lambdas);
+  }
+
+  async _createSqs(events, skipStart) {
+    const resources = this._getResources();
+
+    this.sqs = new SQS(this.lambda, resources, this.options);
+
+    await this.sqs.create(events);
+
+    if (!skipStart) {
+      await this.sqs.start();
+    }
+  }
+
+  _mergeOptions() {
+    const {
+      service: {custom = {}, provider}
+    } = this.serverless;
+
+    const offlineOptions = custom[OFFLINE_OPTION];
+    const customOptions = custom[CUSTOM_OPTION];
+
+    this.options = Object.assign(
+      {},
+      omitUndefined(defaultOptions),
+      omitUndefined(provider),
+      omitUndefined(pick('location', offlineOptions)), // serverless-webpack support
+      omitUndefined(customOptions),
+      omitUndefined(this.cliOptions)
     );
 
-    const next = async () => {
-      const {Messages} = await fromCallback(cb =>
-        client.receiveMessage(
-          {
-            QueueUrl,
-            MaxNumberOfMessages: queueEvent.batchSize,
-            AttributeNames: ['All'],
-            MessageAttributeNames: ['All'],
-            WaitTimeSeconds: 1
-          },
-          cb
-        )
-      );
+    debugLog('options:', this.options);
+  }
 
-      if (Messages) {
-        await fromCallback(cb => this.eventHandler(queueEvent, functionName, Messages, cb));
+  _getEvents() {
+    const {service} = this.serverless;
 
-        await fromCallback(cb =>
-          client.deleteMessageBatch(
-            {
-              Entries: (Messages || []).map(({MessageId: Id, ReceiptHandle}) => ({
-                Id,
-                ReceiptHandle
-              })),
-              QueueUrl
-            },
-            () => cb()
-          )
-        );
-      }
+    const lambdas = [];
+    const sqsEvents = [];
 
-      next();
+    const functionKeys = service.getAllFunctions();
+
+    functionKeys.forEach(functionKey => {
+      const functionDefinition = service.getFunction(functionKey);
+
+      lambdas.push({functionKey, functionDefinition});
+
+      const events = service.getAllEventsInFunction(functionKey) || [];
+
+      events.forEach(event => {
+        const {sqs} = this._resolveFn(event);
+
+        if (sqs && functionDefinition.handler) {
+          sqsEvents.push({
+            functionKey,
+            handler: functionDefinition.handler,
+            sqs
+          });
+        }
+      });
+    });
+
+    return {
+      sqsEvents,
+      lambdas
     };
-
-    next();
   }
 
-  offlineStartInit() {
-    this.serverless.cli.log(`Starting Offline SQS.`);
+  _resolveFn(obj) {
+    const Resources = get(['service', 'resources', 'Resources'], this.serverless);
 
-    mapValues.convert({cap: false})((_function, functionName) => {
-      const queues = pipe(get('events'), filter(has('sqs')), map(get('sqs')))(_function);
+    return pipe(
+      toPairs,
+      map(([key, value]) => {
+        if (!isPlainObject(value)) return [key, value];
 
-      if (!isEmpty(queues)) {
-        printBlankLine();
-        this.serverless.cli.log(`SQS for ${functionName}:`);
-      }
+        if (has('Fn::GetAtt', value)) {
+          const [resourceName, attribute] = value['Fn::GetAtt'];
 
-      forEach(queueEvent => {
-        this.createQueueReadable(functionName, queueEvent);
-      }, queues);
+          switch (attribute) {
+            case 'Arn': {
+              const type = get([resourceName, 'Type'], Resources);
 
-      if (!isEmpty(queues)) {
-        printBlankLine();
-      }
-    }, this.service.functions);
+              switch (type) {
+                case 'AWS::SQS::Queue': {
+                  const queueName = get([resourceName, 'Properties', 'QueueName'], Resources);
+                  return [
+                    key,
+                    `arn:aws:sqs:${this.options.region}:${this.options.accountId}:${queueName}`
+                  ];
+                }
+                default: {
+                  return null;
+                }
+              }
+            }
+            default: {
+              return null;
+            }
+          }
+        }
+        return [key, this._resolveFn(value)];
+      }),
+      compact,
+      fromPairs
+    )(obj);
   }
 
-  offlineStartEnd() {
-    this.serverless.cli.log('offline-start-end');
+  _getResources() {
+    const Resources = get(['service', 'resources', 'Resources'], this.serverless);
+    return this._resolveFn(Resources);
   }
 }
 

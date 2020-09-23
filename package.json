@@ -1,23 +1,30 @@
 {
+  "name": "serverless-plugins",
   "private": true,
+  "engines": {
+    "node": ">=10"
+  },
   "scripts": {
     "postinstall": "lerna bootstrap",
     "eslint": "eslint .",
     "ava": "ava",
     "nyc": "nyc ava",
     "ava:profile": "node node_modules/ava/profile.js",
-    "pretest": "npm run eslint",
-    "test": "npm run nyc",
+    "pretest:unit": "docker-compose up -d",
+    "test:unit": "npm run nyc",
+    "posttest:unit": "docker-compose stop",
+    "test:integration": "lerna run test --stream --scope serverless-offline-plugins-integration",
+    "test": "npm run eslint && npm run test:unit && npm run test:integration",
     "publish": "lerna publish"
   },
   "dependencies": {
-    "lerna": "^3.13.1",
-    "serverless": "^1.39.1"
+    "lerna": "^3.22.1",
+    "serverless": "^1.83.0"
   },
   "devDependencies": {
-    "@coorpacademy/eslint-plugin-coorpacademy": "^8.1.1",
-    "ava": "^1.4.0",
-    "eslint": "^5.15.3",
-    "nyc": "^13.3.0"
+    "@coorpacademy/eslint-plugin-coorpacademy": "^10.2.0",
+    "ava": "^3.12.1",
+    "eslint": "^7.9.0",
+    "nyc": "^15.1.0"
   }
 }

@@ -1,5 +1,4 @@
-**/node_modules
-packges/**/packages-lock.json
+node_modules
 
 # Serverless directories
 .serverless
@@ -14,3 +13,6 @@ coverage
 
 # OSX
 .DS_Store
+
+# Python
+*.pyc

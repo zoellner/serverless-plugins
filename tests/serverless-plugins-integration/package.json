@@ -1,0 +1,36 @@
+{
+  "name": "serverless-offline-plugins-integration",
+  "private": true,
+  "version": "1.1.0",
+  "scripts": {
+    "start:kinesis": "sls --config serverless.kinesis.yml offline",
+    "start:sqs": "sls --config serverless.sqs.yml offline",
+    "start:s3": "sls --config serverless.s3.yml offline",
+    "start:dynamodb-streams": "sls --config serverless.dynamodb-streams.yml offline",
+    "test": "npm run test:dynamodb-streams && npm run test:kinesis && npm run test:s3 && npm run test:sqs && npm run test:sqs:autocreate",
+    "setup-service": "../../scripts/clean-start.sh",
+    "pretest:dynamodb-streams": "npm run -s setup-service dynamodb",
+    "test:dynamodb-streams": "node test-dynamodb-streams",
+    "test:sqs": "node test-sqs",
+    "test:s3": "node test-s3",
+    "pretest:sqs": "npm run -s setup-service sqs",
+    "pretest:s3": "npm run -s setup-service s3",
+    "test:sqs:autocreate": "node test-sqs-autocreate",
+    "pretest:sqs:autocreate": "npm run -s setup-service sqs",
+    "test:kinesis": "node test-kinesis",
+    "pretest:kinesis": "npm run -s setup-service kinesis"
+  },
+  "dependencies": {
+    "aws-sdk": "^2.757.0",
+    "lodash": "^4.17.20",
+    "minio": "^7.0.16",
+    "pump": "^3.0.0",
+    "serverless": "^1.83.0",
+    "serverless-offline": "^6.7.0",
+    "serverless-offline-dynamodb-streams": "^4.2.0",
+    "serverless-offline-kinesis": "^4.2.0",
+    "serverless-offline-sqs": "^4.1.1",
+    "serverless-offline-ssm-provider": "^2.1.0",
+    "signal-exit": "^3.0.3"
+  }
+}

@@ -8,9 +8,11 @@
             "type": "node",
             "request": "launch",
             "name": "SQS",
-            "program": "${workspaceFolder}/node_modules/.bin/serverless",
-            "cwd": "${workspaceFolder}/packages/serverless-offline-sqs/example",
+            "program": "${workspaceFolder}/tests/serverless-plugins-integration/node_modules/.bin/sls",
+            "cwd": "${workspaceFolder}/tests/serverless-plugins-integration",
             "args": [
+                "--config",
+                "serverless.sqs.autocreate.yml",
                 "offline",
                 "start"
             ]
@@ -19,9 +21,11 @@
             "type": "node",
             "request": "launch",
             "name": "DynamoDB Streams",
-            "program": "${workspaceFolder}/node_modules/.bin/serverless",
-            "cwd": "${workspaceFolder}/packages/serverless-offline-dynamodb-streams/example",
+            "program": "${workspaceFolder}/tests/serverless-plugins-integration/node_modules/.bin/sls",
+            "cwd": "${workspaceFolder}/tests/serverless-plugins-integration",
             "args": [
+                "--config",
+                "serverless.dynamodb-streams.yml",
                 "offline",
                 "start"
             ]
@@ -30,9 +34,24 @@
             "type": "node",
             "request": "launch",
             "name": "Kinesis",
-            "program": "${workspaceFolder}/node_modules/.bin/serverless",
-            "cwd": "${workspaceFolder}/packages/serverless-offline-kinesis/example",
+            "program": "${workspaceFolder}/tests/serverless-plugins-integration/node_modules/.bin/sls",
+            "cwd": "${workspaceFolder}/tests/serverless-plugins-integration",
             "args": [
+                "--config",
+                "serverless.kinesis.yml",
+                "offline",
+                "start"
+            ]
+        },
+        {
+            "type": "node",
+            "request": "launch",
+            "name": "S3",
+            "program": "${workspaceFolder}/tests/serverless-plugins-integration/node_modules/.bin/sls",
+            "cwd": "${workspaceFolder}/tests/serverless-plugins-integration",
+            "args": [
+                "--config",
+                "serverless.s3.yml",
                 "offline",
                 "start"
             ]
